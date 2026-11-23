@@ -1,0 +1,201 @@
+{
+  "name": "Phase 1 — Outlook Email Intake & Project Creation",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [{ "mode": "everyMinute" }]
+        },
+        "filters": {
+          "subject": "",
+          "readStatus": "unread",
+          "hasAttachments": true
+        },
+        "options": {
+          "downloadAttachments": true,
+          "attachmentsPrefix": "attachment_"
+        }
+      },
+      "id": "node-outlook-trigger",
+      "name": "Microsoft Outlook Trigger",
+      "type": "n8n-nodes-base.microsoftOutlookTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "credentials": {
+        "microsoftOutlookOAuth2Api": {
+          "id": "YOUR_OUTLOOK_CREDENTIAL_ID",
+          "name": "Qadri Group Outlook"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Node: Validate Email ────────────────────────────────────────────────────\n// Enforces business rules BEFORE any storage or DB operations.\n// Returns the email if valid, stops the workflow with a logged error if not.\n\nconst email = $input.first().json;\n\n// Rule 1: Must have message ID (deduplication key)\nif (!email.id) {\n  throw new Error('VALIDATION_FAILED: Missing Outlook message ID — cannot deduplicate.');\n}\n\n// Rule 2: Must have a subject\nif (!email.subject || email.subject.trim() === '') {\n  throw new Error('VALIDATION_FAILED: Email has no subject — rejecting.');\n}\n\n// Rule 3: Must have a sender\nif (!email.from?.emailAddress?.address) {\n  throw new Error('VALIDATION_FAILED: Email has no sender — rejecting.');\n}\n\n// Rule 4: Must have at least one PDF attachment\nconst attachments = email.attachments || [];\nconst pdfAttachments = attachments.filter(a => {\n  const name = (a.name || '').toLowerCase();\n  const mime = (a.contentType || '').toLowerCase();\n  return name.endsWith('.pdf') || mime.includes('pdf');\n});\n\nif (pdfAttachments.length === 0) {\n  throw new Error('VALIDATION_FAILED: No PDF attachments found — rejecting email.');\n}\n\n// Rule 5: Reject non-PDF MIME types we cannot process\nconst ALLOWED_MIMES = ['application/pdf', 'image/jpeg', 'image/png', 'image/tiff'];\nconst allAttachments = attachments.filter(a => {\n  const mime = (a.contentType || '').toLowerCase();\n  return ALLOWED_MIMES.some(allowed => mime.includes(allowed.split('/')[1]));\n});\n\nreturn [{\n  json: {\n    ...email,\n    _validated: true,\n    _pdfAttachments: pdfAttachments,\n    _allValidAttachments: allAttachments.length > 0 ? allAttachments : pdfAttachments,\n  }\n}];"
+      },
+      "id": "node-validate-email",
+      "name": "Validate Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Node: Prepare Attachment Loop ───────────────────────────────────────────\n// Splits the attachments array into individual items for the upload loop.\n// Each item contains the attachment data PLUS the parent email context.\n\nconst email = $input.first().json;\nconst attachments = email._allValidAttachments || [];\n\nreturn attachments.map((attachment, index) => ({\n  json: {\n    attachment,\n    attachmentIndex: index,\n    totalAttachments: attachments.length,\n    // Parent email context carried through the loop\n    emailContext: {\n      outlookMessageId: email.id,\n      internetMessageId: email.internetMessageId,\n      conversationId: email.conversationId,\n      subject: email.subject,\n      body: email.body?.content || email.bodyPreview || '',\n      bodyPreview: email.bodyPreview || '',\n      senderEmail: email.from?.emailAddress?.address || '',\n      senderName: email.from?.emailAddress?.name || '',\n      recipients: (email.toRecipients || []).map(r => ({\n        email: r.emailAddress?.address || '',\n        name: r.emailAddress?.name || '',\n      })),\n      receivedAt: email.receivedDateTime || new Date().toISOString(),\n    }\n  }\n}));"
+      },
+      "id": "node-prepare-loop",
+      "name": "Prepare Attachment Loop",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/storage/v1/object/{{ $env.SUPABASE_STORAGE_BUCKET }}/{{ $json.emailContext.outlookMessageId }}/{{ $json.attachment.name }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "={{ $json.attachment.contentType }}" },
+            { "name": "x-upsert", "value": "true" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "={{ 'attachment_' + ($json.attachmentIndex) }}"
+      },
+      "id": "node-upload-to-supabase",
+      "name": "Upload to Supabase Storage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Node: Enrich with Storage Path ──────────────────────────────────────────\n// Adds the confirmed storage path to each attachment record.\n// Calculates a simple file size from available data.\n\nconst item = $input.first().json;\nconst uploadResponse = $input.first().json;\n\n// Build the storage path consistent with the upload URL\nconst storagePath = `${item.emailContext.outlookMessageId}/${item.attachment.name}`;\n\nreturn [{\n  json: {\n    ...item,\n    uploadedAttachment: {\n      original_filename: item.attachment.name,\n      mime_type: item.attachment.contentType || 'application/octet-stream',\n      file_size_bytes: item.attachment.size || 0,\n      storage_path: storagePath,\n      storage_provider: 'supabase',\n      checksum: null,\n    }\n  }\n}];"
+      },
+      "id": "node-enrich-storage",
+      "name": "Enrich with Storage Path",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "destinationFieldName": "uploadedAttachments",
+        "include": "specifiedFields",
+        "fieldsToInclude": "uploadedAttachment, emailContext"
+      },
+      "id": "node-aggregate",
+      "name": "Aggregate Uploaded Attachments",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [1440, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Node: Build FastAPI Webhook Payload ─────────────────────────────────────\n// Assembles the final JSON payload to send to FastAPI.\n// This is the exact contract defined by OutlookWebhookPayload schema.\n\nconst items = $input.all();\nconst first = items[0].json;\nconst emailCtx = first.emailContext || first.uploadedAttachments?.[0]?.emailContext;\nconst attachments = items.map(i => i.json.uploadedAttachment).filter(Boolean);\n\nconst payload = {\n  outlook_message_id: emailCtx.outlookMessageId,\n  internet_message_id: emailCtx.internetMessageId || null,\n  conversation_id: emailCtx.conversationId || null,\n  subject: emailCtx.subject,\n  body: emailCtx.body,\n  body_preview: emailCtx.bodyPreview || null,\n  sender_email: emailCtx.senderEmail,\n  sender_name: emailCtx.senderName || null,\n  recipients: emailCtx.recipients || [],\n  received_at: emailCtx.receivedAt,\n  attachments: attachments,\n};\n\nreturn [{ json: payload }];"
+      },
+      "id": "node-build-payload",
+      "name": "Build FastAPI Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FASTAPI_BASE_URL }}/api/v1/webhooks/outlook",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Internal-Key", "value": "={{ $env.INTERNAL_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "node-call-fastapi",
+      "name": "POST to FastAPI Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1920, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Node: Log Success ────────────────────────────────────────────────────────\nconst response = $input.first().json;\nconsole.log('✅ Project created successfully:', {\n  project_id: response.project_id,\n  project_number: response.project_number,\n  email_id: response.email_id,\n  files_ingested: response.files_ingested,\n  drawings_created: response.drawings_created,\n});\nreturn [{ json: { success: true, ...response } }];"
+      },
+      "id": "node-log-success",
+      "name": "Log Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2160, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Node: Handle Error ───────────────────────────────────────────────────────\n// Catches errors from any upstream node and logs them.\n// In production, this should also write to an error_logs table.\n\nconst error = $input.first();\nconsole.error('❌ Email intake failed:', {\n  error: error.json?.error || error.json?.detail || 'Unknown error',\n  timestamp: new Date().toISOString(),\n});\nreturn [{ json: { success: false, error: error.json } }];"
+      },
+      "id": "node-handle-error",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2160, 420]
+    }
+  ],
+  "connections": {
+    "Microsoft Outlook Trigger": {
+      "main": [[{ "node": "Validate Email", "type": "main", "index": 0 }]]
+    },
+    "Validate Email": {
+      "main": [[{ "node": "Prepare Attachment Loop", "type": "main", "index": 0 }]]
+    },
+    "Prepare Attachment Loop": {
+      "main": [[{ "node": "Upload to Supabase Storage", "type": "main", "index": 0 }]]
+    },
+    "Upload to Supabase Storage": {
+      "main": [[{ "node": "Enrich with Storage Path", "type": "main", "index": 0 }]]
+    },
+    "Enrich with Storage Path": {
+      "main": [[{ "node": "Aggregate Uploaded Attachments", "type": "main", "index": 0 }]]
+    },
+    "Aggregate Uploaded Attachments": {
+      "main": [[{ "node": "Build FastAPI Payload", "type": "main", "index": 0 }]]
+    },
+    "Build FastAPI Payload": {
+      "main": [[{ "node": "POST to FastAPI Webhook", "type": "main", "index": 0 }]]
+    },
+    "POST to FastAPI Webhook": {
+      "main": [
+        [{ "node": "Log Success", "type": "main", "index": 0 }],
+        [{ "node": "Handle Error", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "qadri-portal-phase1"
+  },
+  "pinData": {},
+  "versionId": "phase1-v1.0",
+  "triggerCount": 1,
+  "tags": [
+    { "createdAt": "2026-07-17", "updatedAt": "2026-07-17", "id": "phase1", "name": "Phase 1" }
+  ]
+}
